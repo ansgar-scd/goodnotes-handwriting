@@ -33,10 +33,13 @@ LINE_SPACING = 32.083335876464844
 FIRST_LINE_INDEX = 2          # Line 3 (y ~ 124.67) leaves comfortable top headroom
 MAX_BASELINE_Y = 1478.0       # ~43 lines per A4 page
 
-MARGIN_LEFT = 58.0
+MARGIN_LEFT = 29.0
 MARGIN_RIGHT = 58.0
 
 DESCENDER_CHARS = set("gjpqyßJ")
+UPPER_QUOTE_CHARS = set("“”\"'‘’")
+UPPER_QUOTE_TOP_INSET = 4.0   # place upper quotes slightly below the upper line edge
+NO_BREAK_AFTER_CHARS = set("([{„«")
 PUNCTUATION_CHARS = set(".,!?:;-–()\"'„“/[]")
 CHAR_FALLBACKS = {
     "’": "'",
@@ -126,12 +129,15 @@ class HandwritingEngine:
     def _effective_baseline_offset(key: str, variant: dict) -> float:
         """
         Return the baseline offset relative to glyph top (min_y = 0).
-        Guards against descender variants (g, p, q, y, j) whose auto-snapped
-        baseline landed on the ruled line below the glyph.
+        - Places upper quotation marks near the top of the line (slightly below the upper edge).
+        - Guards against descender variants (g, p, q, y, j) whose auto-snapped
+          baseline landed on the ruled line below the glyph.
         """
         bl = float(variant["baseline_offset"])
         h = float(variant["height"])
         ls = float(variant.get("line_spacing") or LINE_SPACING)
+        if key in UPPER_QUOTE_CHARS:
+            return ls - UPPER_QUOTE_TOP_INSET
         if any(c in DESCENDER_CHARS for c in key) and bl > h + 4.0 and (bl - ls) > 4.0:
             return bl - ls
         return bl
@@ -264,61 +270,126 @@ class HandwritingEngine:
 
             # Split into words while preserving leading indentation if any
             words = para.split(" ")
-            for w_i, raw_word in enumerate(words):
-                if not raw_word:
+
+            # Group into non-breaking wrap units so opening brackets / lower quotes
+            # never stand alone at a line break separated from the following word.
+            units: List[List[str]] = []
+            w_idx = 0
+            n_words = len(words)
+            while w_idx < n_words:
+                w = words[w_idx]
+                if not w:
+                    units.append([""])
+                    w_idx += 1
+                    continue
+                unit = [w]
+                w_idx += 1
+                while unit[-1] and unit[-1][-1] in NO_BREAK_AFTER_CHARS and w_idx < n_words:
+                    spaces_buf: List[str] = []
+                    j = w_idx
+                    while j < n_words and not words[j]:
+                        spaces_buf.append("")
+                        j += 1
+                    if j < n_words:
+                        unit.extend(spaces_buf)
+                        unit.append(words[j])
+                        w_idx = j + 1
+                    else:
+                        break
+                units.append(unit)
+
+            for u_idx, unit in enumerate(units):
+                if unit == [""]:
                     # Extra space
                     cursor_x += rng.uniform(16.0, 21.0)
                     continue
 
-                tokens = self.tokenize_word(raw_word, missing_set)
-                if not tokens:
+                # Pre-select variants & micro-variance for the entire wrap unit
+                unit_plan = []
+                unit_width = 0.0
+                has_glyphs = False
+                for part_i, raw_word in enumerate(unit):
+                    if not raw_word:
+                        sp = rng.uniform(16.0, 21.0)
+                        unit_plan.append(("space", sp))
+                        unit_width += sp
+                        continue
+
+                    tokens = self.tokenize_word(raw_word, missing_set)
+                    if not tokens:
+                        continue
+
+                    word_plan = []
+                    word_width = 0.0
+                    for t_i, tok in enumerate(tokens):
+                        var = self._pick_variant(tok, last_variant_idx, rng)
+                        scale = rng.uniform(0.96, 1.04)  # +/-4%
+                        angle = rng.uniform(-1.5, 1.5)   # +/-1.5 deg
+                        jitter_y = rng.uniform(-1.5, 1.5)
+                        next_tok = tokens[t_i + 1] if t_i + 1 < len(tokens) else None
+                        kern = self._kerning_after(tok, next_tok, rng)
+                        adv = float(var["width"]) * scale + kern
+                        word_plan.append((tok, var, scale, angle, jitter_y, adv))
+                        word_width += adv
+                        if len(tok) > 1:
+                            matched_ligatures += 1
+
+                    unit_plan.append(("word", word_plan))
+                    unit_width += word_width
+                    has_glyphs = True
+
+                    if part_i < len(unit) - 1:
+                        sp = rng.uniform(22.0, 28.0)
+                        unit_plan.append(("space", sp))
+                        unit_width += sp
+
+                if not has_glyphs:
                     continue
 
-                # Pre-select variants & micro-variance for this word so we know its exact width
-                word_plan = []
-                word_width = 0.0
-                for t_i, tok in enumerate(tokens):
-                    var = self._pick_variant(tok, last_variant_idx, rng)
-                    scale = rng.uniform(0.96, 1.04)  # +/-4%
-                    angle = rng.uniform(-1.5, 1.5)   # +/-1.5 deg
-                    jitter_y = rng.uniform(-1.5, 1.5)
-                    next_tok = tokens[t_i + 1] if t_i + 1 < len(tokens) else None
-                    kern = self._kerning_after(tok, next_tok, rng)
-                    adv = float(var["width"]) * scale + kern
-                    word_plan.append((tok, var, scale, angle, jitter_y, adv))
-                    word_width += adv
-                    if len(tok) > 1:
-                        matched_ligatures += 1
-
-                # Word wrap: move to next line if word doesn't fit (unless we're at line start)
-                if cursor_x > MARGIN_LEFT + 10.0 and (cursor_x + word_width) > max_x:
+                # Word wrap: move entire unit to next line if it doesn't fit (unless at line start)
+                if cursor_x > MARGIN_LEFT + 10.0 and (cursor_x + unit_width) > max_x:
                     advance_line()
 
-                # Place each glyph in the word
-                for tok, var, scale, angle, jitter_y, adv in word_plan:
-                    # Fallback wrap only for abnormally long single words exceeding page width
-                    if (cursor_x + float(var["width"]) * scale) > max_x and cursor_x > MARGIN_LEFT + 10.0:
-                        advance_line()
+                # Place each part in the wrap unit
+                for kind, payload in unit_plan:
+                    if kind == "space":
+                        cursor_x += payload
+                        continue
 
-                    base_y = LINE_Y_START + line_idx * LINE_SPACING
-                    rel_x = cursor_x - MARGIN_LEFT
-                    drift_y = slope * rel_x + wave_amp * math.sin(rel_x / 180.0 + wave_phase)
-                    bl_offset = self._effective_baseline_offset(tok, var)
+                    word_plan = payload
+                    for g_i, (tok, var, scale, angle, jitter_y, adv) in enumerate(word_plan):
+                        # Fallback wrap only for abnormally long single words exceeding page width.
+                        # Never strand an opening bracket / lower quote alone at the line break.
+                        glyph_w = float(var["width"]) * scale
+                        if tok in NO_BREAK_AFTER_CHARS and g_i + 1 < len(word_plan):
+                            next_var = word_plan[g_i + 1][1]
+                            next_scale = word_plan[g_i + 1][2]
+                            needed_w = adv + float(next_var["width"]) * next_scale
+                        else:
+                            needed_w = glyph_w
 
-                    strokes = self._transform_variant(
-                        variant=var,
-                        x_origin=cursor_x,
-                        baseline_y=base_y + drift_y + jitter_y,
-                        baseline_offset=bl_offset,
-                        scale=scale,
-                        angle_deg=angle,
-                    )
-                    pages_strokes[current_page_idx].extend(strokes)
-                    cursor_x += max(adv, 2.0)
-                    total_glyphs += 1
+                        if (cursor_x + needed_w) > max_x and cursor_x > MARGIN_LEFT + 10.0:
+                            advance_line()
+
+                        base_y = LINE_Y_START + line_idx * LINE_SPACING
+                        rel_x = cursor_x - MARGIN_LEFT
+                        drift_y = slope * rel_x + wave_amp * math.sin(rel_x / 180.0 + wave_phase)
+                        bl_offset = self._effective_baseline_offset(tok, var)
+
+                        strokes = self._transform_variant(
+                            variant=var,
+                            x_origin=cursor_x,
+                            baseline_y=base_y + drift_y + jitter_y,
+                            baseline_offset=bl_offset,
+                            scale=scale,
+                            angle_deg=angle,
+                        )
+                        pages_strokes[current_page_idx].extend(strokes)
+                        cursor_x += max(adv, 2.0)
+                        total_glyphs += 1
 
                 # Inter-word space
-                if w_i < len(words) - 1:
+                if u_idx < len(units) - 1:
                     cursor_x += rng.uniform(22.0, 28.0)
 
         archive_bytes = write_goodnotes_multipage(
