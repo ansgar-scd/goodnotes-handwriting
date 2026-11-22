@@ -138,13 +138,12 @@ class HandwritingEngine:
 
     @staticmethod
     def _kerning_after(key: str, next_key: Optional[str], rng: random.Random) -> float:
-        """Tight / slightly negative kerning for natural connected German handwriting."""
+        """Clean, legible inter-glyph spacing with subtle natural variance."""
         if next_key is None:
             return 0.0
         if key in PUNCTUATION_CHARS or next_key in PUNCTUATION_CHARS:
-            return rng.uniform(0.2, 1.8)
-        # Tight / slightly negative kerning between letter glyphs
-        return rng.uniform(-2.2, -0.4)
+            return rng.uniform(1.8, 3.6)
+        return rng.uniform(2.2, 4.2)
 
     @staticmethod
     def _transform_variant(
@@ -242,9 +241,9 @@ class HandwritingEngine:
         slope, wave_amp, wave_phase, left_jitter = make_line_drift()
         cursor_x = MARGIN_LEFT + left_jitter
 
-        def advance_line():
+        def advance_line(lines: int = 2):
             nonlocal current_page_idx, line_idx, cursor_x, slope, wave_amp, wave_phase, left_jitter
-            line_idx += 1
+            line_idx += lines
             next_y = LINE_Y_START + line_idx * LINE_SPACING
             if next_y > MAX_BASELINE_Y:
                 pages_strokes.append([])
@@ -320,7 +319,7 @@ class HandwritingEngine:
 
                 # Inter-word space
                 if w_i < len(words) - 1:
-                    cursor_x += rng.uniform(17.5, 23.0)
+                    cursor_x += rng.uniform(22.0, 28.0)
 
         archive_bytes = write_goodnotes_multipage(
             title=title,
